@@ -622,6 +622,120 @@ class TestPEFile(unittest.TestCase):
         self.assertTrue(hasattr(pe, "DIRECTORY_ENTRY_RESOURCE"))
         self.assertEqual([e.id for e in pe.DIRECTORY_ENTRY_RESOURCE.entries], [3])
 
+    def test_resource_cycles_are_bounded(self):
+        # A resource table that references itself, and a lower level that
+        # references an ancestor, must not recurse forever. Both references
+        # are reported, the offending entries are skipped, but the valid
+        # siblings of those entries are still parsed.
+        pe = pefile.PE(data=_resource_cycle_pe())
+
+        warnings = pe.get_warnings()
+        cycle_warnings = [
+            warning for warning in warnings if "cyclic reference" in warning
+        ]
+        self.assertEqual(len(cycle_warnings), 2, warnings)
+
+        # The diagnostics must locate the failure: the original RVAs of the
+        # table and of the offending entry, the target directory, and the
+        # traversal path that led there.
+        nested_warning, root_warning = cycle_warnings
+        self.assertIn("table RVA 0x1040", nested_warning)
+        self.assertIn("entry RVA 0x1050", nested_warning)
+        self.assertIn("directory 0x1000", nested_warning)
+        self.assertIn("Traversal path: 0x1000 -> 0x1040 -> 0x1000", nested_warning)
+
+        self.assertIn("table RVA 0x1000", root_warning)
+        self.assertIn("entry RVA 0x1018", root_warning)
+        self.assertIn("directory 0x1000", root_warning)
+        self.assertIn("Traversal path: 0x1000 -> 0x1000", root_warning)
+
+        # Self-reference on the root table is skipped, ids 3 and 4 survive.
+        self.assertEqual([e.id for e in pe.DIRECTORY_ENTRY_RESOURCE.entries], [3, 4])
+
+        # In the nested table, the back-reference (id 11) is skipped, while
+        # the leaf (id 12) and the shared directory (id 13) survive.
+        type_dir = pe.DIRECTORY_ENTRY_RESOURCE.entries[0].directory
+        self.assertEqual([e.id for e in type_dir.entries], [12, 13])
+
+        leaf = type_dir.entries[0].data
+        self.assertEqual(
+            pe.get_data(leaf.struct.OffsetToData, leaf.struct.Size), b"LEAF"
+        )
+
+    def test_resource_nesting_depth_is_bounded(self):
+        # A long chain of distinct directories must stop at
+        # MAX_RESOURCE_DEPTH, and the diagnostic must locate where it stopped.
+        pe = pefile.PE(data=_resource_deep_chain_pe())
+
+        depth_warnings = [
+            w for w in pe.get_warnings() if "Excessively nested table depth" in w
+        ]
+        self.assertEqual(len(depth_warnings), 1, pe.get_warnings())
+        warning = depth_warnings[0]
+        self.assertIn(f">{pefile.MAX_RESOURCE_DEPTH}", warning)
+        self.assertIn("at RVA 0x1420", warning)
+        self.assertIn("Traversal path: 0x1000 -> 0x1020", warning)
+
+    def test_resource_shared_node_extracted_per_path(self):
+        # A directory referenced from two different resource paths must be
+        # extracted under each path, not cached away after the first visit.
+        pe = pefile.PE(data=_resource_cycle_pe())
+
+        shared_from_root = pe.DIRECTORY_ENTRY_RESOURCE.entries[1].directory
+        shared_from_nested = (
+            pe.DIRECTORY_ENTRY_RESOURCE.entries[0].directory.entries[1].directory
+        )
+
+        self.assertIsNot(shared_from_root, shared_from_nested)
+        self.assertEqual(
+            shared_from_root.struct.Characteristics,
+            shared_from_nested.struct.Characteristics,
+        )
+
+        for shared_dir in (shared_from_root, shared_from_nested):
+            lang_entry = shared_dir.entries[0]
+            self.assertEqual(lang_entry.data.lang, 0x409 & 0x3FF)
+            self.assertEqual(lang_entry.data.sublang, 0x409 >> 10)
+            self.assertEqual(
+                pe.get_data(
+                    lang_entry.data.struct.OffsetToData, lang_entry.data.struct.Size
+                ),
+                b"SHARE",
+            )
+
+    def test_resource_truncated_name_is_bounded(self):
+        # The name length prefix declares more characters than exist in the
+        # file. Parsing must stay within the available data, report the
+        # truncation with the original RVA, and keep the entry usable.
+        pe = pefile.PE(data=_resource_truncated_name_pe())
+
+        warnings = pe.get_warnings()
+        truncated = [w for w in warnings if "the name is truncated" in w]
+        self.assertEqual(len(truncated), 1, warnings)
+        self.assertIn("0x1028", truncated[0])
+
+        entry = pe.DIRECTORY_ENTRY_RESOURCE.entries[0]
+        self.assertIsNotNone(entry.name)
+        self.assertEqual(entry.name.decode("utf-8"), "AB")
+        # Only the bytes actually present count towards the size accounting.
+        self.assertEqual(entry.name.get_pascal_16_length(), 2)
+
+    def test_resource_oversized_name_is_bounded(self):
+        # A length prefix above MAX_RESOURCE_NAME_LENGTH is treated as corrupt
+        # instead of driving an unbounded read.
+        pe = pefile.PE(data=_resource_oversized_name_pe())
+
+        warnings = pe.get_warnings()
+        oversized = [w for w in warnings if "treating it as corrupt" in w]
+        self.assertEqual(len(oversized), 1, warnings)
+        self.assertIn("0x1028", oversized[0])
+        self.assertIn(str(pefile.MAX_RESOURCE_NAME_LENGTH), oversized[0])
+
+        # The named entry is still present and renders as an empty string.
+        entry = pe.DIRECTORY_ENTRY_RESOURCE.entries[0]
+        self.assertIsNotNone(entry.name)
+        self.assertEqual(entry.name.decode("utf-8"), "")
+
     def test_VS_VERSIONINFO_dword_aligment(self):
         # Fixed a bug in pefile < 1.2.10-96. Fixed in revision 96:
         # http://code.google.com/p/pefile/source/detail?r=96
@@ -854,6 +968,160 @@ def _low_alignment_resource_pe():
         "<8sIIIIIIHHI", b".rsrc\x00\x00\x00", len(res), va, len(res), ptr_raw, 0, 0, 0, 0, 0x40000040
     )
     return dos + b"PE\x00\x00" + coff + opt + section + res
+
+
+def _resource_section_pe(section_bytes, va=0x1000, ptr_raw=0x200):
+    """Build a minimal PE32 whose single .rsrc section holds ``section_bytes``.
+
+    The section starts at RVA ``va`` and is laid out at file offset ``ptr_raw``
+    so the resource directory is the section's first byte.
+    """
+    dos = b"MZ" + b"\x00" * 0x3A + struct.pack("<I", 0x40)
+    coff = struct.pack("<HHIIIHH", 0x14C, 1, 0, 0, 0, 0xE0, 0x2102)
+
+    section_alignment = 0x1000
+    file_alignment = 0x200
+    size_of_image = (va + len(section_bytes) + section_alignment - 1) & ~(
+        section_alignment - 1
+    )
+
+    opt = struct.pack("<HBBIIIIII", 0x10B, 0, 0, 0, 0, 0, 0, 0, 0)
+    opt += struct.pack("<III", 0x400000, section_alignment, file_alignment)
+    opt += struct.pack("<HHHHHH", 4, 0, 0, 0, 4, 0)
+    opt += struct.pack("<I", 0)
+    opt += struct.pack("<II", size_of_image, ptr_raw)
+    opt += struct.pack("<IHH", 0, 2, 0)
+    opt += struct.pack("<IIII", 0, 0, 0, 0)
+    opt += struct.pack("<II", 0, 16)
+    dirs = [(0, 0)] * 16
+    dirs[2] = (va, len(section_bytes))  # resource directory
+    for rva, size in dirs:
+        opt += struct.pack("<II", rva, size)
+    assert len(opt) == 0xE0
+
+    section = struct.pack(
+        "<8sIIIIIIHHI",
+        b".rsrc\x00\x00\x00",
+        len(section_bytes),
+        va,
+        len(section_bytes),
+        ptr_raw,
+        0,
+        0,
+        0,
+        0,
+        0x40000040,
+    )
+    headers = dos + b"PE\x00\x00" + coff + opt + section
+    return headers.ljust(ptr_raw, b"\x00") + section_bytes
+
+
+def _res_dir_header(number_of_named, number_of_id):
+    """IMAGE_RESOURCE_DIRECTORY header bytes."""
+    return struct.pack("<IIHHHH", 0, 0, 0, 0, number_of_named, number_of_id)
+
+
+def _res_dir_entry(name, offset, is_directory=True):
+    """IMAGE_RESOURCE_DIRECTORY_ENTRY bytes."""
+    if is_directory:
+        offset |= 0x80000000
+    return struct.pack("<II", name, offset)
+
+
+def _res_data_entry(offset_to_data, size):
+    """IMAGE_RESOURCE_DATA_ENTRY bytes."""
+    return struct.pack("<IIII", offset_to_data, size, 0, 0)
+
+
+def _resource_cycle_pe(va=0x1000):
+    """Resource tree with a self-reference, a back-reference to an ancestor and
+    a directory reachable through two different paths.
+
+    Layout (offsets relative to the start of the resource section):
+
+        0x000 root          ids 3 -> dirA, 5 -> root (self-reference),
+                                 4 -> shared
+        0x040 dirA          ids 11 -> root (ancestor, cycle), 12 -> data,
+                                 13 -> shared
+        0x090 shared        one language entry -> data
+        0x0b0 data entry    -> payload "SHARE"
+        0x0c0 data entry    -> payload "LEAF"
+    """
+
+    buf = bytearray(b"\x00" * 0x1B4)
+
+    def put(offset, data):
+        buf[offset : offset + len(data)] = data
+
+    put(
+        0x000,
+        _res_dir_header(0, 3)
+        + _res_dir_entry(3, 0x040)
+        + _res_dir_entry(5, 0x000)  # self-reference
+        + _res_dir_entry(4, 0x090),  # shared directory
+    )
+    put(
+        0x040,
+        _res_dir_header(0, 3)
+        + _res_dir_entry(11, 0x000)  # reference back to an ancestor
+        + _res_dir_entry(12, 0x0C0, is_directory=False)
+        + _res_dir_entry(13, 0x090),  # same directory as root's id 4
+    )
+    put(
+        0x090,
+        _res_dir_header(0, 1) + _res_dir_entry(0x409, 0x0B0, is_directory=False),
+    )
+    put(0x0B0, _res_data_entry(va + 0x1A0, 5))
+    put(0x0C0, _res_data_entry(va + 0x1B0, 4))
+    put(0x1A0, b"SHARE")
+    put(0x1B0, b"LEAF")
+
+    return _resource_section_pe(bytes(buf), va=va)
+
+
+def _resource_deep_chain_pe(va=0x1000, depth=40):
+    """A chain of ``depth`` distinct nested directories ending in a valid leaf.
+
+    Exercises the nesting-depth bound independently of cycle detection.
+    """
+
+    buf = bytearray(b"\x00" * (0x20 * depth + 0x20))
+    for level in range(depth):
+        offset = level * 0x20
+        target = offset + 0x20
+        buf[offset : offset + 0x10] = _res_dir_header(0, 1)
+        buf[offset + 0x10 : offset + 0x18] = _res_dir_entry(1, target)
+
+    return _resource_section_pe(bytes(buf), va=va)
+
+
+def _resource_truncated_name_pe(va=0x1000):
+    """A named entry whose length prefix claims more characters than the
+    section (and file) actually contains."""
+
+    buf = bytearray(b"\x00" * 0x2E)
+    buf[0x000:0x018] = _res_dir_header(1, 0) + _res_dir_entry(
+        0x80000000 | 0x028, 0x018, is_directory=False
+    )
+    buf[0x018:0x028] = _res_data_entry(va + 0x040, 4)
+    # Declares 10 UTF-16 characters but only "AB" fits before the section end.
+    buf[0x028:0x02A] = struct.pack("<H", 10)
+    buf[0x02A:0x02E] = "AB".encode("utf-16-le")
+
+    return _resource_section_pe(bytes(buf), va=va)
+
+
+def _resource_oversized_name_pe(va=0x1000):
+    """A named entry whose length prefix exceeds MAX_RESOURCE_NAME_LENGTH."""
+
+    buf = bytearray(b"\x00" * 0x2A)
+    buf[0x000:0x018] = _res_dir_header(1, 0) + _res_dir_entry(
+        0x80000000 | 0x028, 0x018, is_directory=False
+    )
+    buf[0x018:0x028] = _res_data_entry(va + 0x040, 4)
+    buf[0x028:0x02A] = struct.pack("<H", pefile.MAX_RESOURCE_NAME_LENGTH + 1)
+
+    return _resource_section_pe(bytes(buf), va=va)
 
 
 def _create_pe(virtual_size, size_of_raw_data):

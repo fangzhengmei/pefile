@@ -100,6 +100,11 @@ MAX_RESOURCE_ENTRIES = 0x8000
 # The maximum depth of nested resource tables
 MAX_RESOURCE_DEPTH = 32
 
+# The maximum length, in UTF-16 code units, of a resource directory entry's
+# name. Names in real files are far shorter than this; the limit keeps the
+# amount of data read for a corrupt / malicious length prefix bounded.
+MAX_RESOURCE_NAME_LENGTH = 0x1000
+
 # Limit number of exported symbols
 MAX_SYMBOL_EXPORT_COUNT = 0x2000
 
@@ -742,10 +747,13 @@ class UnicodeStringWrapperPostProcessor:
     decision about their type.
     """
 
-    def __init__(self, pe, rva_ptr):
+    def __init__(self, pe, rva_ptr, length=None):
         self.pe = pe
         self.rva_ptr = rva_ptr
         self.string = None
+        # When the caller has already read (and possibly clamped) the length
+        # prefix, use it instead of reading it again from the file.
+        self.__length = length
 
     def get_rva(self):
         """Get the RVA of the string."""
@@ -776,6 +784,8 @@ class UnicodeStringWrapperPostProcessor:
             )
 
     def get_pascal_16_length(self):
+        if self.__length is not None:
+            return self.__length
         return self.__get_word_value_at_rva(self.rva_ptr)
 
     def __get_word_value_at_rva(self, rva):
@@ -4676,6 +4686,15 @@ class PE:
         access it). This structure finally points to the resource data.
         All the members of this structure, IMAGE_RESOURCE_DATA_ENTRY,
         are available as its attributes.
+
+        `dirs` holds the chain of directories being parsed, from the root to
+        the table currently being handled. It is intentionally a per-branch
+        path and not a global set of visited directories: a directory that is
+        referenced from more than one resource path is still parsed for each
+        of those paths. A directory that is already present in the chain means
+        the file contains a cyclic reference (either a self-reference or a
+        reference back to an ancestor); such an entry is skipped and reported,
+        while the remaining entries of the table are still processed.
         """
 
         if dirs is None:
@@ -4684,10 +4703,16 @@ class PE:
         if base_rva is None:
             base_rva = rva
 
+        # Keep a readable form of the directory chain around so warnings about
+        # malformed tables can point at both the offending RVA and the path
+        # that led to it.
+        traversal_path = " -> ".join(f"{dir_rva:#x}" for dir_rva in dirs)
+
         if level > MAX_RESOURCE_DEPTH:
             self.__warnings.append(
                 "Error parsing the resources directory. "
-                f"Excessively nested table depth {level} (>{MAX_RESOURCE_DEPTH})"
+                f"Excessively nested table depth {level} (>{MAX_RESOURCE_DEPTH}) "
+                f"at RVA {rva:#x}. Traversal path: {traversal_path}"
             )
             return None
 
@@ -4722,6 +4747,10 @@ class PE:
             return None
 
         dir_entries = []
+
+        # Remember where this table starts: `rva` is advanced over the entries
+        # while looping and diagnostics want to point at the table itself.
+        table_rva = rva
 
         # Advance the RVA to the position immediately following the directory
         # table header and pointing to the first entry in the table
@@ -4780,57 +4809,69 @@ class PE:
                 entry_id = res.Name
             else:
                 ustr_offset = base_rva + res.NameOffset
-                try:
-                    entry_name = UnicodeStringWrapperPostProcessor(self, ustr_offset)
-                    self.__total_resource_bytes += entry_name.get_pascal_16_length()
-                    # If the last entry's offset points before the current's but its end
-                    # is past the current's beginning, assume the overlap indicates a
-                    # corrupt name.
-                    if last_name_begin_end and (
-                        last_name_begin_end[0] < ustr_offset <= last_name_begin_end[1]
-                    ):
-                        # Remove the previous overlapping entry as it's likely to be
-                        # already corrupt data.
-                        strings_to_postprocess.pop()
-                        self.__warnings.append(
-                            "Error parsing the resources directory, "
-                            "attempting to read entry name. "
-                            f"Entry names overlap {ustr_offset:#x}"
-                        )
-                        break
+                entry_name, name_length = self.__read_resource_entry_name(
+                    ustr_offset, traversal_path
+                )
+                if name_length:
+                    self.__total_resource_bytes += name_length
 
-                    last_name_begin_end = (
-                        ustr_offset,
-                        ustr_offset + entry_name.get_pascal_16_length(),
-                    )
-
-                    strings_to_postprocess.append(entry_name)
-
-                except PEFormatError:
+                # If the last entry's offset points before the current's but its end
+                # is past the current's beginning, assume the overlap indicates a
+                # corrupt name.
+                if last_name_begin_end and (
+                    last_name_begin_end[0] < ustr_offset <= last_name_begin_end[1]
+                ):
+                    # Remove the previous overlapping entry as it's likely to be
+                    # already corrupt data.
+                    strings_to_postprocess.pop()
                     self.__warnings.append(
                         "Error parsing the resources directory, "
                         "attempting to read entry name. "
-                        f"Can't read unicode string at offset {ustr_offset:#x}"
+                        f"Entry names overlap {ustr_offset:#x}"
                     )
+                    break
+
+                last_name_begin_end = (
+                    ustr_offset,
+                    ustr_offset + name_length,
+                )
+
+                strings_to_postprocess.append(entry_name)
 
             if res.DataIsDirectory:
                 # One trick malware can do is to recursively reference the next
                 # directory. This causes hilarity to ensue when trying to parse
-                # everything correctly. If the original RVA given to this
-                # function is equal to the next one to parse, we assume that
-                # it's a trick. Instead of raising a PEFormatError this would
-                # skip some reasonable data so we just break.
+                # everything correctly. If the directory to parse is already
+                # part of the chain leading here, we assume that it's a trick
+                # (a self-reference or a reference back to an ancestor).
+                # Instead of raising a PEFormatError this skips the offending
+                # entry only, so the remaining, possibly valid, entries of this
+                # table are still processed.
+                #
+                # Note that `dirs` holds only the current branch, hence a
+                # directory referenced from two different paths is parsed once
+                # for each path, preserving the shared-node semantics.
                 #
                 # 9ee4d0a0caf095314fd7041a3e4404dc is the offending sample
-                if base_rva + res.OffsetToDirectory in dirs:
-                    break
+                directory_rva = base_rva + res.OffsetToDirectory
+                if directory_rva in dirs:
+                    self.__warnings.append(
+                        "Error parsing the resources directory, "
+                        f"Entry {idx} (table RVA {table_rva:#x}, "
+                        f"entry RVA {rva:#x}) references directory "
+                        f"{directory_rva:#x}, which is already part of the "
+                        "traversal path (cyclic reference); skipping the entry. "
+                        f"Traversal path: {traversal_path} -> {directory_rva:#x}"
+                    )
+                    rva += res.sizeof()
+                    continue
 
                 entry_directory = self.parse_resources_directory(
-                    base_rva + res.OffsetToDirectory,
+                    directory_rva,
                     size - (rva - base_rva),  # size
                     base_rva=base_rva,
                     level=level + 1,
-                    dirs=dirs + [base_rva + res.OffsetToDirectory],
+                    dirs=dirs + [directory_rva],
                 )
 
                 if not entry_directory:
@@ -4943,6 +4984,76 @@ class PE:
 
         return ResourceDirData(
             struct=resource_dir, entries=dir_entries
+        )
+
+    def __read_resource_entry_name(self, ustr_offset, traversal_path):
+        """Read the name of a resource directory entry.
+
+        Returns a ``(name_wrapper, length)`` tuple. ``length`` is the number of
+        UTF-16 code units in the name that are actually available, or 0 when
+        the name is unusable. For a well-formed name this is exactly the value
+        that used to be read by ``get_pascal_16_length()``, so accounting and
+        overlap detection are unchanged for valid files. A wrapper is always
+        returned: an unusable name still marks the entry as a named one, it
+        just renders as an empty string (which is the historical behaviour).
+
+        The read is bounded: names longer than ``MAX_RESOURCE_NAME_LENGTH``
+        code units are treated as corrupt, and a name whose declared length
+        runs past the available data is reported as truncated rather than
+        silently yielding an empty name. Every failure is reported with the
+        original RVA of the name and the path of the table being parsed.
+        """
+
+        def unusable(reason):
+            self.__warnings.append(
+                "Error parsing the resources directory, "
+                "attempting to read entry name. "
+                f"{reason} at offset {ustr_offset:#x} "
+                f"(table path: {traversal_path})"
+            )
+            return UnicodeStringWrapperPostProcessor(self, ustr_offset, length=0), 0
+
+        try:
+            # Reading the length prefix validates that the RVA is readable.
+            prefix = self.get_data(ustr_offset, 2)
+        except PEFormatError:
+            return unusable("Can't read unicode string")
+
+        if len(prefix) < 2:
+            return unusable("The name length prefix is truncated")
+
+        length = struct.unpack("<H", prefix)[0]
+        if length > MAX_RESOURCE_NAME_LENGTH:
+            return unusable(
+                f"The name declares {length} characters "
+                f"(>{MAX_RESOURCE_NAME_LENGTH}); treating it as corrupt"
+            )
+
+        # Verify the declared name fits in the data that is available. get_data
+        # clamps to the section and the end of the file, so a short result
+        # means the name is truncated.
+        name_bytes_length = 2 + length * 2
+        try:
+            raw = self.get_data(ustr_offset, name_bytes_length)
+        except PEFormatError:
+            raw = b""
+
+        available = max((len(raw) - 2) // 2, 0)
+        if len(raw) < name_bytes_length:
+            self.__warnings.append(
+                "Error parsing the resources directory, "
+                "attempting to read entry name. "
+                f"The name at offset {ustr_offset:#x} declares {length} "
+                f"characters but only {available} are available; "
+                "the name is truncated "
+                f"(table path: {traversal_path})"
+            )
+
+        # Keep whatever could be read so the entry is still identifiable, but
+        # never claim more characters than are actually present.
+        return (
+            UnicodeStringWrapperPostProcessor(self, ustr_offset, length=available),
+            available,
         )
 
 
